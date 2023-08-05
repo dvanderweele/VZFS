@@ -4,16 +4,33 @@ function normalize(path, cwdArr){
   if(!/^[a-zA-Z0-9_/.-]*$/.test(path)) throw "Invalid character(s) in path."
   if(path === "/..") throw "Invalid path";
   if (path === "/.") path = "/";
-  if (/\/\.\.$/.test(path)) path = `${path}/`;
+  if (/\/\.\.$/.test(path)) path = `${path}/`; // does the path string end in /..    if so, add a / on the end
+  console.log(path)
   path = path
     .split("/")
-    .reduce((acc, curr) => {
-      if (acc.length === 0 || curr !== acc[acc.length - 1]) {
+    .reduce((acc, curr, idx, arr) => {
+      /*if (
+        acc.length === 0 || 
+        (curr !== "" && curr !== acc[acc.length - 1])
+      ) {*/
         acc.push(curr);
-      }
+      //}
+      /*console.log(`debug: acc - ${
+        JSON.stringify(
+          acc
+        )
+      }; curr - ${
+        curr
+      }; idx - ${
+        idx
+      }; arr - ${
+        JSON.stringify(
+          arr
+        )
+      }`)*/
       return acc;
     }, [])
-    .filter((v, i, a) => !(i > 0 && i < a.length - 1 && v === ""))
+    .filter((v, i, a) => !(i > 0 && i < a.length - 1 && v === "")) // filter out values in middle of array which are empty strings
   if (path.length === 1) {
     return `/${path
       .reduce((acc, curr) => {
@@ -49,9 +66,9 @@ function normalize(path, cwdArr){
 function absPathToPieces(path) {
   return path.split("/")
     .reduce((acc, curr) => {
-      if (acc.length === 0 || curr !== acc[acc.length - 1]) {
+      /*if (acc.length === 0 || curr !== acc[acc.length - 1]) {*/
         acc.push(curr);
-      }
+      /*}*/
       return acc;
     }, [])
     .filter((v, i, a) => !(i > 0 && i < a.length - 1 && v === ""))

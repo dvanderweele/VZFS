@@ -7,7 +7,6 @@ Legend:
 
 Entity
 ------
-- id
 - name
 - path
 - isLeaf
@@ -17,19 +16,17 @@ Entity
 
 Content
 -------
-- id
-- leafId
+- leafPath
 - <body>
 
 Lock
 ----
-- id
 - expiry
 - pathPrefix
 - createdAt
 */
 
-function lockPath(
+function lockPath( 
   db, 
   cwd, 
   path, 
@@ -61,7 +58,8 @@ function lockPath(
           e.target.result
         )
       }
-      rq.onerror = () => {
+      rq.onerror = e => {
+        console.log(`lock acquisition error: ${e.target.error}`)
         rej(
           `Could not acquire lock for path prefix ${
             n
@@ -72,9 +70,9 @@ function lockPath(
   )
 }
 
-function removeLockById(
+function removeLock( // convert to path
   db, 
-  id
+  path
 ){
   return new Promise(
     ir => {
@@ -87,7 +85,7 @@ function removeLockById(
         )
       const rq = lockTable
         .delete(
-          id
+          path
         )
       rq.onsuccess = () => {
         ir(1)
@@ -99,10 +97,16 @@ function removeLockById(
   )
 }
 
-function getLockById(
+function getLock( // convert to path
   db,
-  id
+  path
 ){
+  const n = normalize(
+    path,
+    absPathToPieces(
+      cwd
+    )
+  )
   return new Promise(
     (res, rej) => {
       const lockTable = db
@@ -112,31 +116,40 @@ function getLockById(
         ).objectStore("lock")
       const rq = lockTable
         .get(
-          id
+          n
         )
       rq.onsuccess = e => {
         if(e.target.result) res(
           e.target.result
         );
         else rej(
-          `Could not find lock with id ${
-            id
+          `Could not find lock with path prefix ${
+            n
           }`
         )
       }
       rq.onerror = () => {
         rej(
-          `Could not get lock with id ${id}.`
+          `Could not get lock with path prefix ${
+            n
+          }.`
         )
       }
     }
   )
 }
 
-function entityWithIdExists(
+function entityExists( 
   db,
-  id
+  cwd,
+  path
 ){
+  const n = normalize(
+    path,
+    absPathToPieces(
+      cwd
+    )
+  )
   return new Promise(
     (res, rej) => {
       const entityTable = db
@@ -148,21 +161,23 @@ function entityWithIdExists(
         )
       const rq = entityTable
         .count(
-          id
+          n
         )
       rq.onsuccess = e => {
         res(rq.result > 0)
       }
       rq.onerror = () => {
         rej(
-          `Could not count entities with id ${id}.`
+          `Could not count entities with path ${
+            n
+          }.`
         )
       }
     }
   )
 }
 
-function entityWithPathExists(
+/*function entityWithPathExists(// convert to path
   db,
   cwd,
   path
@@ -202,7 +217,7 @@ function entityWithPathExists(
       }
     }
   )
-}
+}*/
 
 function joinContentToLeaf(
   db,
@@ -217,23 +232,19 @@ function joinContentToLeaf(
         ).objectStore(
           "content"
         )
-      const leafIdIndex = contentTable
-        .index(
-          "leafId"
-        )
-      const rq = leafIdIndex
+      const rq = contentTable
         .get(
-          IDBKKeyRange.only(
-            leaf.id
+          IDBKeyRange.only(
+            leaf.path
           )
         )
       rq.onsuccess = e => {
         res({
           ...leaf,
-          content: e.target.result.body || null
+          content: e.target.result.content || null
         })
       }
-      rq.onerror = () => {
+      rq.onerror = (e) => {
         res({
           ...leaf,
           content: null
@@ -243,10 +254,17 @@ function joinContentToLeaf(
   )
 }
 
-function getEntityById(
+function getEntity(
   db, 
-  id 
+  cwd,
+  path
 ){
+  const n = normalize(
+    path,
+    absPathToPieces(
+      cwd
+    )
+  )
   return new Promise(
     (res, rej) => {
       const entityTable = db
@@ -256,28 +274,30 @@ function getEntityById(
         ).objectStore("entity")
       const rq = entityTable
         .get(
-          id
+          n
         );
       rq.onsuccess = e => {
         if(e.target.result) res(
           e.target.result
         );
         else rej(
-          `Could not find entity with id ${
-            id
+          `Could not find entity with path ${
+            n
           }`
         );
       }
       rq.onerror = () => {
         rej(
-          `Could not get entity with id ${id}.`
+          `Could not get entity with path ${
+            n
+          }.`
         )
       }
     }
   )
 }
 
-function getEntityByPath(
+/*function getEntityByPath(
   db, 
   cwd, 
   path 
@@ -315,9 +335,9 @@ function getEntityByPath(
       }
     }
   )
-}
+}*/
 
-function getEntitiesByPathPrefix(
+function getEntitiesByPrefix(
   db, 
   cwd, 
   pathPrefix 
@@ -336,16 +356,13 @@ function getEntitiesByPathPrefix(
       ).objectStore(
         "entity"
       )
-      const pathIndex = entityTable.index(
-        "path"
-      )
       const range = IDBKeyRange.bound(
         n, 
         n + '\uffff', 
         false, 
         false
       )
-      const rq = pathIndex.getAll(
+      const rq = entityTable.getAll(
         range
       )
       rq.onsuccess = e => {
@@ -418,14 +435,21 @@ function getEntitiesByPathPrefix(
   )
 }*/
 
-function getImmediateChildKeysOfDirectory(
+function getImmediateChildKeysOfDirectory( // convert to path
   db,
   cwd,
-  id
+  path
 ){
-  return getEntityById(
+  const n = normalize(
+    path,
+    absPathToPieces(
+      cwd
+    )
+  )
+  return getEntity(
     db,
-    id
+    cwd,
+    n
   ).then(
     directory => {
       if(directory.isLeaf) throw "Not a directory"
@@ -438,14 +462,14 @@ function getImmediateChildKeysOfDirectory(
             ).objectStore(
               "entity"
             )
-          const parentIdIndex = entityTable
+          const parentPathIndex = entityTable
             .index(
-              "parentId"
+              "parentPath"
             )
-          const rq = parentIdIndex
+          const rq = parentPathIndex
             .getAllKeys(
               IDBKeyRange.only(
-                directory.id
+                directory.path
               )
             )
           rq.onsuccess = e => {
@@ -455,8 +479,8 @@ function getImmediateChildKeysOfDirectory(
           }
           rq.onerror = () => {
             rej(
-              `Could not get child keys of directory with id ${
-                id
+              `Could not get child keys of directory with path ${
+                n
               }.`
             )
           }
@@ -477,11 +501,18 @@ function countEntityByPathPrefix(db, cwd, pathPrefix){
 }
 */
 
-function insertContentRecord(
+function insertContentRecord(// convert to path
   db,
-  leafId,
+  cwd,
+  leafPath,
   content
 ){
+  const n = normalize(
+    leafPath,
+    absPathToPieces(
+      cwd
+    )
+  )
   return new Promise(
     (res, rej) => {
       const contentTable = db
@@ -492,19 +523,19 @@ function insertContentRecord(
           "content"
         )
       const rq = contentTable
-        .put(
-          content,
-          leafId
-        )
+        .put({
+          content: content,
+          leafPath: leafPath
+        })
       rq.onsuccess = e => {
         res({
-          contentId: e.target.result
+          leafPath: e.target.result
         })
       }
       rq.onerror = () => {
         rej(
-          `Could not insert content record for leaf with id ${
-            leafId
+          `Could not insert content record for leaf with path ${
+            leafPath
           }.`
         )
       }
@@ -512,11 +543,18 @@ function insertContentRecord(
   )
 }
 
-function updateContentRecordByLeafId(
+function updateContentRecord(// convert to path
   db,
-  leafId,
+  cwd,
+  leafPath,
   newContent
 ){
+  const n = normalize(
+    leafPath,
+    absPathToPieces(
+      cwd
+    )
+  )
   return new Promise(
     (res, rej) => {
       const contentTable = db
@@ -526,23 +564,21 @@ function updateContentRecordByLeafId(
         ).objectStore(
           "content"
         )
-      const leafIdIndex = contentTable
-        .index(
-          "leafId"
-        )
-      const rq = leafIdIndex
+      const rq = contentTable
         .openCursor(
           IDBKeyRange.only(
-            leafId
+            n
           )
         )
       let contentUpdates = 0
       rq.onsuccess = e => {
         const cursor = e.target.result
         if(cursor) {
+          const u = cursor.value
+          u.content = newContent
           contentUpdates += 1
           cursor.update(
-            newContent
+            u
           )
           cursor.continue()
         } else {
@@ -553,8 +589,8 @@ function updateContentRecordByLeafId(
       }
       rq.onerror = () => {
         rej(
-          `Could not update content record for leaf with id ${
-            leafId
+          `Could not update content record for leaf with n ${
+            n
           }.`
         )
       }
@@ -562,10 +598,17 @@ function updateContentRecordByLeafId(
   )
 }
 
-function deleteContentRecordByLeafId(
+function deleteContentRecord(// convert to path
   db,
-  leafId
+  cwd,
+  leafPath
 ){
+  const n = normalize(
+    leafPath,
+    absPathToPieces(
+      cwd
+    )
+  )
   return new Promise(
     (res, rej) => {
       const contentTable = db
@@ -575,14 +618,10 @@ function deleteContentRecordByLeafId(
         ).objectStore(
           "content"
         )
-      const leafIdIndex = contentTable
-        .index(
-          "leafId"
-        )
-      const rq = leafIdIndex
+      const rq = contentTable
         .openCursor(
           IDBKeyRange.only(
-            leafId
+            n
           )
         )
       let contentDeletes = 0
@@ -609,30 +648,26 @@ function deleteContentRecordByLeafId(
   )
 }
 
-function rejectIfConflictingLockPathPrefixes(
+function rejectIfConflictingLockPathPrefixes(// convert to path
   db, 
-  referenceLockIds, 
+  cwd,
+  referenceLockPaths, 
   unexpiredLocksOnly = true
 ){
   return Promise.all(
-    referenceLockIds.map(
-      l => getLockById(
+    referenceLockPaths.map(
+      l => getEntity(
         db,
+        cwd,
         l
       )
     )
   ).then(
     results => new Promise(
       (res, rej) => {
-        const ids = new Set(
-          results.map(
-            v => v.id
-          )
+        const paths = results.map(
+          v => v.path
         )
-        const pathPrefixes = results
-          .map(
-            v => v.pathPrefix
-          )
         const lockTable = db
           .transaction(
             "lock",
@@ -658,18 +693,20 @@ function rejectIfConflictingLockPathPrefixes(
             .target
             .result
             .filter(
-              l => !ids.has(l.id)
+              l => !paths.includes(
+                l.pathPrefix
+              )
             )
           const conflicts = locks
             .reduce(
               (acc, cur) => {
                 if(
-                  pathPrefixes
+                  paths
                     .reduce(
-                      (a, c) => {
+                      (_, c) => {
                         if(
                           c.startsWith(
-                            curr.pathPrefix
+                            cur.pathPrefix
                           )
                         ){
                           return acc + 1
@@ -709,16 +746,23 @@ function rejectIfConflictingLockPathPrefixes(
   )
 }
 
-function addFileEntity(
+function addFileEntity(// convert to path
   db, 
   cwd, 
   name, 
-  parentId, 
+  parentPath, 
   content // content dereferencing refactor
 ){
-  return getEntityById(
+  const n = normalize(
+    parentPath,
+    absPathToPieces(
+      cwd
+    )
+  )
+  return getEntity(
     db,
-    parentId
+    cwd,
+    n
   ).then(
     parent => new Promise(
       (res, rej) => {
@@ -734,7 +778,7 @@ function addFileEntity(
             name
           }. File names must be alphanumeric, dashes, dots, and underscores.`
         );
-        const n = normalize(
+        const n2 = normalize(
           parent.path + name,
           absPathToPieces(
             cwd
@@ -750,9 +794,9 @@ function addFileEntity(
           );
         const rq = entityTable
           .add({
-            path: n,
+            path: n2,
             isLeaf: true,
-            parentId: parent.id,
+            parentPath: parent.path,
             createdAt: time,
             updatedAt: time,
             name
@@ -762,21 +806,24 @@ function addFileEntity(
             e.target.result
           )
         }
-        rq.onerror = () => {
+        rq.onerror = e => {
           rej(
             `Could not add file entity with name ${
               name
             } to parent ${
               parent.path
-            }.`
+            }: ${
+              e.target.error.message
+            }`
           )
         }
       }
     )
   ).then(
-    leafId => insertContentRecord(
+    leafPath => insertContentRecord(
       db,
-      leafId,
+      cwd,
+      leafPath,
       content
     )
   )
@@ -786,20 +833,29 @@ function addDirectoryEntity(
   db, 
   cwd, 
   name, 
-  parentId
+  parentPath
 ){
-  return getEntityById(
+  const n = normalize(
+    parentPath,
+    absPathToPieces(
+      cwd
+    )
+  )
+  return getEntity(
     db,
-    parentId
+    cwd,
+    n
   ).then(
     parent => new Promise(
       (res, rej) => {
-        const n = normalize(
-          parent.path + name,
+        console.log(`parentPath ${parent.path} name ${name}`)
+        const n2 = normalize(
+          parent.path + name + "/",
           absPathToPieces(
             cwd
           )
         );
+        console.log(`n2 ${n2}`)
         const time = Date.now()
         const entityTable = db
           .transaction(
@@ -808,11 +864,23 @@ function addDirectoryEntity(
           ).objectStore(
             "entity"
           )
+        console.log(
+          JSON.stringify(
+            {
+            path: n2,
+            isLeaf: false,
+            parentPath: parent.path,
+            createdAt: time,
+            updatedAt: time,
+            name
+          }
+          )
+        )
         const rq = entityTable
           .add({
-            path: n,
+            path: n2,
             isLeaf: false,
-            parentId: parent.id,
+            parentPath: parent.path,
             createdAt: time,
             updatedAt: time,
             name
@@ -822,7 +890,7 @@ function addDirectoryEntity(
             e.target.result
           )
         }
-        rq.onerror = () => {
+        rq.onerror = e => {
           rej(
             `Could not add directory entity with name ${
               name
@@ -836,29 +904,38 @@ function addDirectoryEntity(
   )
 }
 
-function deleteEntityById(
+function deleteEntity(
   db, 
-  id // content dereferencing refactor
+  cwd,
+  path // content dereferencing refactor
 ){
+  const n = normalize(
+    path,
+    absPathToPieces(
+      cwd
+    )
+  )
   return new Promise(
     (res, rej) => {
       const entityTable = db
         .transaction(
           "entity",
-          "readonly"
+          "readwrite"
         ).objectStore("entity")
       const rq = entityTable
         .delete(
-          id
+          n
         )
       rq.onsuccess = () => {
         res(
-          id
+          n
         )
       }
       rq.onerror = () => {
         rej(
-          `Could not delete entity with id ${id}; it may have already been deleted.`
+          `Could not delete entity with path ${
+            path
+          }; it may have already been deleted.`
         )
       }
     }
@@ -867,45 +944,67 @@ function deleteEntityById(
 
 function deleteLeafEntity(
   db, 
-  id // content dereferencing refactor
+  cwd,
+  path// content dereferencing refactor
 ){
-  return getEntityById(
+  return getEntity(
     db,
-    id
+    cwd,
+    path
   ).then(
     file => {
-      if(!file.isLeaf) throw `Cannot delete non-leaf entity with id ${
-        id
+      if(!file.isLeaf) throw `Cannot delete non-leaf entity with path ${
+        file.path
       }.`
-      return deleteEntityById(
+      return deleteEntity(
         db,
-        id
+        cwd,
+        path
       )
     }
   ).then(
-    leafId => deleteContentRecordByLeafId(
+    leafPath => deleteContentRecord(
       db,
-      leafId
+      cwd,
+      leafPath
     )
   )
 }
 
 function deleteDirectoryIfEmpty(
   db, 
-  id 
+  cwd,
+  path
 ){
-  return getEntityById(
+  return getEntity(
     db,
-    id
+    cwd,
+    path
   ).then( 
     directory => new Promise(
       (res, rej) => {
         if(
           directory.isLeaf
         ) rej(
-          `Cannot delete directory with id ${
-            id
+          `Cannot delete entity with path ${
+            directory.path
           } because it is a leaf.`
+        );
+        if(
+          directory.path === "/"
+        ) rej(
+          `Cannot delete entity with path ${
+            directory.path
+          } because it is the root directory.`
+        );
+        if(
+          cwd.startsWith(
+            directory.path
+          )
+        ) rej(
+          `Cannot delete entity with path ${
+            directory.path
+          } because it is a prefix of the current working directory.`
         );
         const entityTable = db
           .transaction(
@@ -916,54 +1015,57 @@ function deleteDirectoryIfEmpty(
           )
         const parentIdIndex = entityTable
           .index(
-            "parentId"
+            "parentPath"
           )
         const rq = parentIdIndex
           .count(
             IDBKeyRange.only(
-              id
+              directory.path
             )
           )
         rq.onsuccess = () => {
           if(rq.result !== 0) rej(
-            `Cannot delete directory with id ${
-              id
+            `Cannot delete directory with path ${
+              directory.path
             } because it is not empty.`
           );
-          res(id);
+          res(directory.path);
         }
         rq.onerror = () => {
           rej(
-            `Could not count number of children for directory with id ${
-              id
+            `Could not count number of children for directory with path ${
+              directory.path
             }.`
           )
         }
       }
     )
   ).then(
-    id => deleteEntityById(
+    path => deleteEntity(
       db,
-      id
+      cwd,
+      path
     )
   )
 }
 
 function emptyDirectory(
   db, 
-  id // content dereferencing refactor
+  cwd,
+  path// content dereferencing refactor
 ){
-  return getEntityById(
+  return getEntity(
     db,
-    id
+    cwd,
+    path
   ).then(
     directory => new Promise(
       (res, rej) => {
         if(
           directory.isLeaf
         ) rej(
-          `Cannot empty directory with id ${
-            id
+          `Cannot empty entity with path ${
+            directory.path
           } because it is a leaf.`
         );
         const entityTable = db
@@ -973,28 +1075,28 @@ function emptyDirectory(
           ).objectStore(
             "entity"
           )
-        const parentIdIndex = entityTable
+        const parentPathIndex = entityTable
           .index(
-            "parentId"
+            "parentPath"
           )
-        const rq = parentIdIndex
+        const rq = parentPathIndex
           .count(
             IDBKeyRange.only(
-              id
+              directory.path
             )
           )
         rq.onsuccess = () => {
           if(rq.result === 0) rej(
-            `Cannot empty directory with id ${
-              id
+            `Cannot empty entity with path ${
+              directory.path
             } because it is already empty.`
           );
           res(directory.path);
         }
         rq.onerror = () => {
           rej(
-            `Could not count number of children for directory with id ${
-              id
+            `Could not count number of children for directory with path ${
+              directory.path
             }.`
           )
         }
@@ -1010,39 +1112,33 @@ function emptyDirectory(
           ).objectStore(
             "entity"
           )
-        const pathIndex = entityTable
-          .index(
-            "path"
-          )
-        const rq = pathIndex
+        const rq = entityTable
           .openCursor(
-            IDBKKeyRange.bound(
+            IDBKeyRange.bound(
               pathPrefix,
               pathPrefix + '\uffff',
               true,
               false
             )
           )
-        const deletedIds = []
+        const deletedPaths = []
         var deletions = 0
         rq.onsuccess = e => {
           const cursor = e.target.result
           if(cursor) {
-            if(cursor.value.isLeaf) deletedIds.push(cursor.value.id)
+            if(cursor.value.isLeaf) deletedPaths.push(cursor.value.path)
             cursor.delete()
             deletions++
             cursor.continue() 
           } else {
             res(
-              deletedIds
+              deletedPaths
             )
           }
         }
         rq.onerror = () => {
           rej(
-            `Could not empty directory with id ${
-              id
-            } and path ${
+            `Could not empty directory with path ${
               pathPrefix
             }.`
           )
@@ -1050,10 +1146,11 @@ function emptyDirectory(
       }
     )
   ).then(
-    deletedIds => Promise.allSettled(
-      deletedIds.map(
-        v => deleteContentRecordByLeafId(
+    deletedPaths => Promise.allSettled(
+      deletedPaths.map(
+        v => deleteContentRecord(
           db,
+          cwd,
           v
         )
       )
@@ -1061,20 +1158,21 @@ function emptyDirectory(
   )
 }
 
-function updateFileEntity(
+function updateFileTimestamp(
   db, 
-  id, 
-  content // content dereferencing refactor
+  cwd,
+  path
 ){
-  return getEntityById(
+  return getEntity(
     db,
-    id
+    cwd,
+    path
   ).then(
     file => new Promise(
       (res, rej) => {
         if(!file.isLeaf) rej(
-          `Entity with id ${
-            id
+          `Entity with path ${
+            file.path
           } is not a leaf entity.`
         )
         const time = Date.now()
@@ -1088,77 +1186,7 @@ function updateFileEntity(
         const rq = entityTable
           .openCursor(
             IDBKeyRange.only(
-              id
-            )
-          )
-        const contentUpdateMapping = {}
-        var updates = 0
-        rq.onsuccess = e => {
-          const cursor = e.target.result
-          if(cursor) {
-            const u = cursor.value
-            u.updatedAt = time
-            contentUpdateMapping[u.id] = content
-            cursor.update(
-              u
-            )
-            ++updates
-            cursor.continue()
-          } else {
-            res(
-              contentUpdateMapping
-            )
-          }
-        }
-        rq.onerror = () => {
-          rej(
-            `Could not update file entity with id ${
-              id
-            }.`
-          )
-        }
-      }
-    )
-  ).then(
-    contentUpdates => Promise.allSettled(
-      Object.entries(contentUpdates).map(
-        v => updateContentRecordByLeafId(
-          db,
-          v[0],
-          v[1]
-        )
-      )
-    )
-  )
-}
-
-function updateFileEntityTimestamp(
-  db, 
-  id
-){
-  return getEntityById(
-    db,
-    id
-  ).then(
-    file => new Promise(
-      (res, rej) => {
-        if(!file.isLeaf) rej(
-          `Entity with id ${
-            id
-          } is not a leaf entity.`
-        )
-        const time = Date.now()
-        const entityTable = db
-          .transaction(
-            "entity",
-            "readwrite"
-          ).objectStore(
-            "entity"
-          )
-        const rq = entityTable
-          .openCursor(
-            IDBKeyRange.only(
-              id
+              file.path
             )
           )
         var updates = 0
@@ -1180,8 +1208,8 @@ function updateFileEntityTimestamp(
         }
         rq.onerror = () => {
           rej(
-            `Could not update file entity with id ${
-              id
+            `Could not update file with path ${
+              file.path
             }.`
           )
         }
@@ -1190,32 +1218,61 @@ function updateFileEntityTimestamp(
   )
 }
 
-function renameFileEntity(
+function updateFile(
   db, 
   cwd,
-  id, 
+  path, 
+  content // content dereferencing refactor
+){
+  return getEntity(
+    db,
+    cwd,
+    path
+  ).then(
+    file => Promise.allSettled([
+      updateFileTimestamp(
+        db,
+        cwd,
+        path
+      ),
+      updateContentRecord(
+        db,
+        cwd,
+        path,
+        content
+      )
+    ])
+  )
+}
+
+function renameFile(
+  db, 
+  cwd,
+  path, 
   newName
 ){
   let file, parent
-  return getEntityById(
+  return getEntity( // auto-get the file
     db,
-    id
+    cwd,
+    path
   ).then(
     result => {
       file = result
-      return getEntityById(
+      return getEntity(
         db,
-        file.parentId
+        cwd,
+        file.parentPath
       )
-    }
+    } // auto-get parent
   ).then(
     result => {
       parent = result
-      new Promise(
+      return new Promise(
         (res, rej) => {
           if(!file.isLeaf) rej(
-            `Entity with id ${
-              id
+            `Entity with path ${
+              file.path
             } is not a leaf entity.`
           )
           if(
@@ -1225,7 +1282,8 @@ function renameFileEntity(
             ) rej(
               `Invalid file name: ${
                 newName
-              }. File names must be alphanumeric, dashes, dots, and underscores.`)
+              }. File names must be alphanumeric, dashes, dots, and underscores.`
+          )
           const n = normalize(
             parent.path + newName,
             absPathToPieces(
@@ -1240,52 +1298,138 @@ function renameFileEntity(
               "entity"
             )
           const rq = entityTable
-            .openCursor(
-              IDBKeyRange.only(id)
+            .delete(
+              IDBKeyRange.only(
+                file.path
+              )
             )
-          let renamings = 0
           rq.onsuccess = e => {
-            const cursor = e.target.result
-            if(cursor){
-              const u = cursor.value
-              u.name = newName
-              u.path = n
-              cursor.update(u)
-              renamings++
-              cursor.continue()
-            } else {
-              res(renamings)
-            }
+            res({
+              oldFile: file,
+              parent: parent,
+              newPath: n,
+              newName
+            })
           }
           rq.onerror = () => {
             rej(
-              `Could not rename file entity with id ${
-                id
+              `Could not rename file with path ${
+                file.path
               } to ${
                 newName
-              }.`)
+              }.`
+            )
           }
         }
       )
-    }
+    } // man-delete original
+  ).then(
+    ({
+      oldFile,
+      parent,
+      newPath,
+      newName
+    }) => new Promise( // man-get old content
+      (res, rej) => {
+        const contentTable = db
+          .transaction(
+            "content",
+            "readwrite"
+          ).objectStore(
+            "content"
+          )
+        const rq = contentTable
+          .get(
+            oldFile.path
+          )
+        rq.onsuccess = e => {
+          const content = e.target.result
+          if(content) {
+            res({
+              oldFile: oldFile,
+              parent: parent,
+              newPath: newPath,
+              newName: newName,
+              content: content
+            })
+          } else {
+            rej(
+              `Could not find content record with path ${
+                oldFile.path
+              }.`
+            )
+          }
+        }
+        rq.onerror = () => {
+          rej(
+            `Could not find content record with path ${
+              oldFile.path
+            }.`
+          )
+        }
+      }
+    )
+  ).then(
+    ({
+      oldFile,
+      parent,
+      newPath,
+      newName,
+      content
+    }) => Promise.allSettled([
+      new Promise( // man-delete old content
+        (res, rej) => {
+          const contentTable = db
+            .transaction(
+              "content",
+              "readwrite"
+            ).objectStore(
+              "content"
+            )
+          const rq = contentTable
+            .delete(
+              oldFile.path
+            )
+          rq.onsuccess = () => {
+            res()
+          }
+          rq.onerror = () => {
+            rej(
+              `Could not delete content record with path ${
+                oldFile.path
+              }.`
+            )
+          }
+        }
+      ),
+      addFileEntity( // auto-recreate fild
+        db, 
+        cwd, 
+        newName, 
+        parent.path, 
+        content.content
+      ) // ->getEntity->insertContentRecord(man-addcontent)
+    ])
   )
 }
 
-function reparentLeafEntity(
+function reparentLeaf(
   db,
   cwd,
-  id,
-  newParentId
+  path,
+  newParentPath
 ){
   return Promise.all(
     [
-      getEntityById(
+      getEntity(
         db,
-        id
+        cwd,
+        path
       ),
-      getEntityById(
+      getEntity(
         db,
-        newParentId
+        cwd,
+        newParentPath
       )
     ]
   ).then(
@@ -1306,8 +1450,8 @@ function reparentLeafEntity(
           "New parent cannot be a leaf entity."
         )
         if(!leaf.isLeaf) rej(
-          `Entity with id ${
-            id
+          `Entity with path ${
+            leaf.path
           } is not a leaf entity.`
         )
         const entityTable = db
@@ -1319,14 +1463,16 @@ function reparentLeafEntity(
           )
         const rq = entityTable
           .openCursor(
-            IDBKeyRange.only(id)
+            IDBKeyRange.only(
+              leaf.path
+            )
           )
         var reparentings = 0
         rq.onsuccess = e => {
           const cursor = e.target.result
           if(cursor){
             const u = cursor.value
-            u.parentId = newParent.id
+            u.parentPath = newParent.path
             u.path = newPath
             cursor.update(u)
             reparentings++
@@ -1337,8 +1483,8 @@ function reparentLeafEntity(
         }
         rq.onerror = () => {
           rej(
-            `Could not reparent leaf entity with id ${
-              id
+            `Could not reparent leaf with path ${
+              leaf.path
             } to new parent ${
               newParent.path
             }.`
@@ -1351,18 +1497,20 @@ function reparentLeafEntity(
 
 function transplantAncestors(
   db, 
-  oldParentId,
-  newParentId
+  oldParentPath,
+  newParentPath
 ){
   return Promise.all(
     [
-      getEntityById(
+      getEntity(
         db,
-        oldParentId
+        cwd,
+        oldParentPath
       ),
-      getEntityById(
+      getEntity(
         db,
-        newParentId
+        cwd,
+        newParentPath
       )
     ]
   ).then(
@@ -1383,11 +1531,7 @@ function transplantAncestors(
           ).objectStore(
             "entity"
           )
-        const pathIndex = entityTable
-          .index(
-            "path"
-          )
-        const rq = pathIndex
+        const rq = entityTable
           .openCursor(
             IDBKeyRange.bound(
               oldParent.path,
@@ -1401,11 +1545,11 @@ function transplantAncestors(
           const cursor = e.target.result
           if (cursor) {
             const u = cursor.value
-            if(u.id === newParent.id) cursor.continue()
+            if(u.path === newParent.path) cursor.continue()
             if(
-              u.parentId === oldParent.id
+              u.parentPath === oldParent.path
             ){
-              u.parentId = newParent.id
+              u.parentPath = newParent.path
             } 
             u
               .path = normalize(
@@ -1464,12 +1608,14 @@ function pruneExpiredLocks(
         r(e.target.result)
       }
       rq.onerror = () => {
-        j("Error reading expired locks.")
+        j(
+          "Error reading expired locks."
+        )
       }
     }
   ).then(
     results => Promise.allSettled(
-      results.map(id => {
+      results.map(path => {
         return new Promise(
           (r, j) => {
             const lockTable = db
@@ -1478,7 +1624,9 @@ function pruneExpiredLocks(
                 "readwrite"
               ).objectStore("lock")
             const rq = lockTable
-              .delete(id)
+              .delete(
+                path
+              )
             rq.onsuccess = () => {
               r(
                 "Expired lock pruned succesfully."
@@ -1486,7 +1634,7 @@ function pruneExpiredLocks(
             }
             rq.onerror = () => {
               j(
-                "Error deleting expired lock by id; it may have already been deleted."
+                "Error deleting expired lock by path; it may have already been deleted."
               )
             }
           }
@@ -1498,29 +1646,27 @@ function pruneExpiredLocks(
 
 export {
   lockPath,
-  removeLockById,
-  getLockById,
-  entityWithIdExists,
-  entityWithPathExists,
+  removeLock,
+  getLock,
+  entityExists,
   joinContentToLeaf,
-  insertContentRecord,
-  updateContentRecordByLeafId,
-  deleteContentRecordByLeafId,
-  getEntityById,
-  getEntityByPath,
-  getEntitiesByPathPrefix,
+  getEntity,
+  getEntitiesByPrefix,
   getImmediateChildKeysOfDirectory,
+  insertContentRecord,
+  updateContentRecord,
+  deleteContentRecord,
   rejectIfConflictingLockPathPrefixes,
   addFileEntity,
   addDirectoryEntity,
-  deleteEntityById,
+  deleteEntity,
   deleteLeafEntity,
   deleteDirectoryIfEmpty,
   emptyDirectory,
-  updateFileEntity,
-  updateFileEntityTimestamp,
-  renameFileEntity,
-  reparentLeafEntity,
+  updateFile,
+  updateFileTimestamp,
+  renameFile,
+  reparentLeaf,
   transplantAncestors,
   pruneExpiredLocks
 }

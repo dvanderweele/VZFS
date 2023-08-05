@@ -66,33 +66,31 @@ Lock Management
 * if lock creation/insertion fails due to this index, one search should be made for the extant lock record to check its expiry. if it is expired, it may be deleted and an automatic retry may happen.
 
 */
-import { createMachine, actions, send, sendParent } from "xstate"
-import { normalize, absPathToPieces } from  "../utils/path.js"
+import { createMachine, actions, send, raise, sendParent } from "xstate"
+import { normalize, absPathToPieces } from "../utils/path.js"
 import {
   lockPath,
-  removeLockById,
-  getLockById,
-  entityWithIdExists,
-  entityWithPathExists,
+  removeLock,
+  getLock,
+  entityExists,
   joinContentToLeaf,
-  insertContentRecord,
-  updateContentRecordByLeafId,
-  deleteContentRecordByLeafId,
-  getEntityById,
-  getEntityByPath,
-  getEntitiesByPathPrefix,
+  getEntity,
+  getEntitiesByPrefix,
   getImmediateChildKeysOfDirectory,
+  insertContentRecord,
+  updateContentRecord,
+  deleteContentRecord,
   rejectIfConflictingLockPathPrefixes,
   addFileEntity,
   addDirectoryEntity,
-  deleteEntityById,
+  deleteEntity,
   deleteLeafEntity,
   deleteDirectoryIfEmpty,
   emptyDirectory,
-  updateFileEntity,
-  updateFileEntityTimestamp,
-  renameFileEntity,
-  reparentLeafEntity,
+  updateFile,
+  updateFileTimestamp,
+  renameFile,
+  reparentLeaf,
   transplantAncestors,
   pruneExpiredLocks
 } from "../promises/IDB.js"
@@ -100,6 +98,7 @@ import {
 const { assign, log } = actions
 
 const storageHierarchy = createMachine({
+  predictableActionArguments: true,
   initial: "uninitialized",
   context: {
     cwd: "/",
@@ -110,24 +109,270 @@ const storageHierarchy = createMachine({
       initial: "idle",
       states: {
         idle: {
-          entry: log(),
           on: {
             init: {
               target: "initializing",
-              cond: (_, evt) => typeof evt.filesystemName === "string",
+              cond: (_, evt) => typeof evt.filesystemName === "string" && typeof evt.version === "number",
               actions: assign((ctx, evt) => ({
                 ...ctx,
-                fsName: evt.filesystemName
+                fsName: evt.filesystemName,
+                version: evt.version
               }))
+            },
+            listFilesystems: {
+              target: "listingFilesystems"
+            },
+            dropFilesystem: {
+              target: "droppingFilesystem"
+            },
+            restoreFilesystemFromJSON: {
+              target: "restoringFilesystemFromJSON"
             }
           }
         },
-        // other states in between here for, e.g., listing or dropping filesystems?
+        listingFilesystems: {
+          invoke: {
+            src: () => {
+              return indexedDB.databases()
+            },
+            onDone: {
+              target: "idle",
+              actions: [
+                sendParent(
+                  (_, evt) => {
+                    return {
+                      type: "listFilesystemsSuccess",
+                      filesystems: evt.data
+                    }
+                  }
+                )
+              ]
+            },
+            onError: {
+              target: "idle",
+              actions: [
+                sendParent(
+                  (_, evt) => ({
+                    type: "listFilesystemsFailure",
+                    error: evt.data
+                  })
+                )
+              ]
+            }
+          }
+        },
+        droppingFilesystem: {
+          invoke: {
+            src: (_, evt) => {
+              return new Promise(
+                (res, rej) => {
+                  const rq = indexedDB.deleteDatabase(
+                    evt.fsName
+                  )
+                  rq.onsuccess = () => {
+                    res()
+                  }
+                  rq.onerror = () => {
+                    rej(rq.error)
+                  }
+                }
+              )
+            },
+            onDone: {
+              target: "idle",
+              actions: [
+                sendParent(
+                  () => ({
+                    type: "dropFilesystemSuccess"
+                  })
+                )
+              ]
+            },
+            onError: {
+              target: "idle",
+              actions: [
+                sendParent(
+                  (_, evt) => ({
+                    type: "dropFilesystemFailure",
+                    error: evt.data
+                  })
+                )
+              ]
+            }
+          }
+        },
+        restoringFilesystemFromJSON: {
+          invoke: {
+            src: (_, evt) => Promise.resolve(
+              typeof indexedDB.databases !== "undefined" ? indexedDB.databases() : []
+            ).then(
+              databaseNames => new Promise(
+                (res, rej) => {
+                  if(
+                    typeof indexedDB.databases !== "undefined" && databaseNames.includes(
+                      evt.fsName
+                    )
+                  ) {
+                    rej(
+                      "Filesystem with provided name already exists"
+                    )
+                  }
+                  const req = window.indexedDB.open(
+                    evt.fsName, 
+                    evt.version
+                  )
+                  req.onsuccess = (evt) => {
+                    db = evt.target.result
+                    res(db)
+                  }
+                  req.onerror = () => {
+                    rej()
+                  }
+                  req.onupgradeneeded = e => {
+                    const db = e.target.result
+                    const entity = db.createObjectStore(
+                      "entity", 
+                      {
+                        keyPath: "path"
+                      }
+                    )
+                    entity.createIndex(
+                      "name", 
+                      "name"
+                    )
+                    entity.createIndex(
+                      "parentPath", 
+                      "parentPath"
+                    )
+                    entity.createIndex(
+                      "createdAt", 
+                      "createdAt"
+                    )
+                    entity.createIndex(
+                      "updatedAt", 
+                      "updatedAt"
+                    )
+                    entity.createIndex(
+                      "uniqueParentChild", [
+                      "parentPath",
+                      "name"
+                    ], {
+                      unique: true
+                    }
+                    )
+                    const lock = db.createObjectStore(
+                      "lock", {
+                      keyPath: "pathPrefix"
+                    }
+                    )
+                    lock.createIndex(
+                      "expiry", 
+                      "expiry"
+                    )
+                    lock.createIndex(
+                      "createdAt", 
+                      "createdAt"
+                    )
+                    const content = db.createObjectStore(
+                      "content", 
+                      {
+                        keyPath: "leafPath"
+                      }
+                    )
+                  }
+                }
+              )
+            ).then(
+              newDB => {
+                const { entity, lock, content } = JSON.parse(
+                  evt.backup
+                )
+                return Promise.all(
+                  [
+                    Promise.all(
+                      entity.map(e => new Promise(
+                        (res, rej) => {
+                          const tab = newDB
+                            .transaction(
+                              "entity", 
+                              "readwrite"
+                            ).objectStore(
+                              "entity"
+                            )
+                          const req = tab.put(
+                            e
+                          )
+                          req.onsuccess = res
+                          req.onerror = rej
+                        }
+                      ))
+                    ),
+                    Promise.all(
+                      content.map(e => new Promise(
+                        (res, rej) => {
+                          const tab = newDB
+                            .transaction(
+                              "content", 
+                              "readwrite"
+                            ).objectStore(
+                              "content"
+                            )
+                          const req = tab.put(
+                            e
+                          )
+                          req.onsuccess = res
+                          req.onerror = rej
+                        }
+                      ))
+                    ),
+                    Promise.all(
+                      lock.map(e => new Promise(
+                        (res, rej) => {
+                          const tab = newDB
+                            .transaction(
+                              "lock", 
+                              "readwrite"
+                            ).objectStore(
+                              "lock"
+                            )
+                          const req = tab.put(
+                            e
+                          )
+                          req.onsuccess = res
+                          req.onerror = rej
+                        }
+                      ))
+                    )
+                  ]
+                )
+              }
+            ),
+            onDone: {
+              target: "idle",
+              actions: [
+                sendParent(
+                  "restoreFilesystemFromJSONSuccess"
+                )
+              ]
+            },
+            onError: {
+              target: "idle",
+              actions: [
+                sendParent(
+                  "restoreFilesystemFromJSONFailure"
+                )
+              ]
+            }
+          }
+        },
         initializing: {
           invoke: {
             src: ctx => new Promise(
               (res, rej) => {
-                const req = indexedDB.open(ctx.fsName, version)
+                const req = window.indexedDB.open(
+                  ctx.fsName, 
+                  ctx.version
+                )
                 req.onsuccess = (evt) => {
                   db = evt.target.result
                   res(db)
@@ -138,50 +383,52 @@ const storageHierarchy = createMachine({
                 req.onupgradeneeded = e => {
                   const db = e.target.result
                   const entity = db.createObjectStore(
-                    "entity", { 
-                      autoIncrement: true 
+                    "entity", 
+                    {
+                      keyPath: "path"
                     }
                   )
-                  entity.createIndex("name", "name")
-                  entity.createIndex("parentId", "parentId")
-                  entity.createIndex("createdAt", "createdAt")
-                  entity.createIndex("updatedAt", "updatedAt")
                   entity.createIndex(
-                    "path", 
-                    "path", {
-                      unique: true
-                    }
+                    "name", 
+                    "name"
+                  )
+                  entity.createIndex(
+                    "parentPath", 
+                    "parentPath"
+                  )
+                  entity.createIndex(
+                    "createdAt", 
+                    "createdAt"
+                  )
+                  entity.createIndex(
+                    "updatedAt", 
+                    "updatedAt"
                   )
                   entity.createIndex(
                     "uniqueParentChild", [
-                      "parentId", 
-                      "name"
-                    ], {
-                      unique: true
-                    }
+                    "parentPath",
+                    "name"
+                  ], {
+                    unique: true
+                  }
                   )
                   const lock = db.createObjectStore(
                     "lock", {
-                      autoIncrement: true
-                    }
+                    keyPath: "pathPrefix"
+                  }
                   )
                   lock.createIndex(
-                    "pathPrefix", 
-                    "pathPrefix", {
-                      unique: true
-                    }
+                    "expiry", 
+                    "expiry"
                   )
-                  lock.createIndex("expiry", "expiry")
-                  lock.createIndex("createdAt", "createdAt")
+                  lock.createIndex(
+                    "createdAt", 
+                    "createdAt"
+                  )
                   const content = db.createObjectStore(
-                    "content", {
-                      autoIncrement: true
-                    }
-                  )
-                  content.createIndex(
-                    "leafId", 
-                    "leafId", {
-                      unique: true
+                    "content", 
+                    {
+                      keyPath: "leafPath"
                     }
                   )
                 }
@@ -189,16 +436,23 @@ const storageHierarchy = createMachine({
             ),
             onDone: {
               target: "seeding",
-              actions: assign((ctx, evt) => ({
-                ...ctx,
-                db: evt.data
-              }))
+              actions: [
+                assign((ctx, evt) => ({
+                  ...ctx,
+                  db: evt.data
+                }))
+              ]
             },
             onError: {
               target: "idle",
-              actions: log(
-                "Failed to initialize filesystem."
-              )
+              actions: [
+                log(
+                  "Failed to initialize filesystem."
+                ),
+                log(
+                  (_, e) => e.toString()
+                )
+              ]
             }
           }
         },
@@ -208,7 +462,7 @@ const storageHierarchy = createMachine({
               (res, rej) => {
                 const { db } = ctx
                 const table = db.transaction(
-                  "entity",
+                  ["entity"],
                   "readwrite"
                 ).objectStore("entity")
                 const t = Date.now()
@@ -216,30 +470,37 @@ const storageHierarchy = createMachine({
                   name: "",
                   path: "/",
                   isLeaf: false,
-                  parentId: null,
+                  parentPath: null,
                   createdAt: t,
                   updatedAt: t
                 })
                 rq.onsuccess = () => {
                   res()
                 }
-                rq.onerror = ({ name }) => {
-                  if(name === "ConstraintError") {
+                rq.onerror = e => {
+                  const name = e.target.error.name
+                  if (name === "ConstraintError") {
                     res()
                   } else {
-                    rej()
+                    rej(name)
                   }
                 }
               }
             ),
             onDone: {
-              target: "done"
+              target: "done",
+              actions: []
             },
             onError: {
               target: "idle",
-              actions: log(
-                "Attempt to conditionally seed root directory / failed and it was not a unique constraint violation."
-              )
+              actions: [
+                log(
+                  "Attempt to conditionally seed root directory / failed and it was not a unique constraint violation."
+                ),
+                log(
+                  (_, e) => e.toString()
+                )
+              ]
             }
           }
         },
@@ -263,8 +524,8 @@ const storageHierarchy = createMachine({
             pruning: {
               invoke: {
                 src: (
-                  { 
-                    db 
+                  {
+                    db
                   }
                 ) => pruneExpiredLocks(
                   db
@@ -285,71 +546,33 @@ const storageHierarchy = createMachine({
           initial: "awaitingCommand",
           states: {
             awaitingCommand: {
+              entry: [
+                raise(
+                  "pruneExpiredLocks"
+                ),
+                sendParent(
+                  "vzfsAwaitingCommand"
+                ),
+              ],
               on: {
                 close: "close",
+                changeDirectory: "changeDirectory",
                 createFile: "createFile",
-                readFileById: "readFileById",
-                readFileByPath: "readFileByPath",
-                renameFileById: "renameFileById",
-                renameFileByPath: "renameFileByPath",
-                // TODO - add rest of these 
+                readFile: "readFile",
+                updateFileTimestamp: "updateFileTimestamp",
+                updateFileContent: "updateFileContent",
+                deleteFile: "deleteFile",
+                createDirectory: "createDirectory",
+                getDirectoryRecord: "getDirectoryRecord",
+                emptyDirectory: "emptyDirectory",
+                deleteDirectoryIfEmpty: "deleteDirectoryIfEmpty",
+                ripFilesystemToJSON: "ripFilesystemToJSON",
               }
             },
-            changeDirectoryById: {
+            changeDirectory: {
               invoke: {
                 src: (ctx, evt) => {
-                  const { 
-                    db,
-                    cwd
-                  } = ctx
                   const {
-                    newDirectoryId
-                  } = evt.data
-                  return new Promise(
-                    (res, rej) => {
-                      (async () => {
-                        try {
-                          const entity = await getEntityById(
-                            db,
-                            newDirectoryId
-                          )
-                          if(entity.isLeaf) rej(
-                            `Cannot change directory to a leaf.`
-                          );
-                          res(entity.path)
-                        } catch(e) {
-                          rej(e)
-                        } 
-                      })()
-                    }
-                  )
-                },
-                onDone: {
-                  target: "awaitingCommand",
-                  actions: [
-                    assign((ctx, evt) => ({
-                      ...ctx,
-                      cwd: evt.data
-                    })),
-                    sendParent(
-                      "changeDirectorySuccess"
-                    )
-                  ]
-                },
-                onError: {
-                  target: "awaitingCommand",
-                  actions: [
-                    sendParent(
-                      "changeDirectoryFailure"
-                    )
-                  ]
-                }
-              }
-            },
-            changeDirectoryByPath: {
-              invoke: {
-                src: (ctx, evt) => {
-                  const { 
                     db,
                     cwd
                   } = ctx
@@ -360,17 +583,22 @@ const storageHierarchy = createMachine({
                     (res, rej) => {
                       (async () => {
                         try {
-                          const entity = await getEntityByPath(
+                          const entity = await getEntity(
                             db,
+                            cwd,
                             newDirectoryPath
                           )
-                          if(entity.isLeaf) rej(
+                          if (entity.isLeaf) rej(
                             `Cannot change directory to a leaf.`
                           );
-                          res(entity.path)
-                        } catch(e) {
-                          rej(e)
-                        } 
+                          res(
+                            entity.path
+                          )
+                        } catch (e) {
+                          rej(
+                            e
+                          )
+                        }
                       })()
                     }
                   )
@@ -382,17 +610,19 @@ const storageHierarchy = createMachine({
                       ...ctx,
                       cwd: evt.data
                     })),
-                    sendParent(
-                      "changeDirectorySuccess"
-                    )
+                    sendParent({
+                      type: "changeDirectorySuccess",
+                      cwd: ctx=> ctx.cwd
+                    })
                   ]
                 },
                 onError: {
                   target: "awaitingCommand",
                   actions: [
-                    sendParent(
-                      "changeDirectoryFailure"
-                    )
+                    sendParent((_, evt) => ({
+                      type: "changeDirectoryFailure",
+                      msg: evt.data
+                    }))
                   ]
                 }
               }
@@ -400,25 +630,26 @@ const storageHierarchy = createMachine({
             createFile: {
               invoke: {
                 src: (ctx, evt) => {
-                  const { 
+                  const {
                     db,
                     cwd
                   } = ctx
                   const {
                     name,
-                    parentId,
+                    parentPath,
                     content
                   } = evt.data
                   return new Promise(
                     (res, rej) => {
                       (async () => {
-                        let newLockId
+                        let newLockPath, parent
                         try {
-                          const parent = await getEntityById(
+                          parent = await getEntity(
                             db,
-                            parentId
+                            cwd,
+                            parentPath
                           )
-                          newLockId = await lockPath(
+                          newLockPath = await lockPath(
                             db,
                             cwd,
                             parent.path,
@@ -426,29 +657,32 @@ const storageHierarchy = createMachine({
                           )
                           await rejectIfConflictingLockPathPrefixes(
                             db,
-                            [newLockId]
+                            cwd,
+                            [newLockPath]
                           )
-                        } catch(e) {
+                        } catch (e) {
                           rej(e)
                         }
                         try {
-                          const newFileId = await addFileEntity(
+                          const newFilePath = await addFileEntity(
                             db,
                             cwd,
                             name,
-                            parent.id,
+                            parent.path,
                             content
                           )
-                          res(newFileId)
-                        } catch(e) {
+                          res(newFilePath)
+                        } catch (e) {
                           rej(e)
                         } finally {
                           try {
-                            await removeLockById(
+                            await removeLock(
                               db,
-                              newLockId
+                              newLockPath
                             )
-                          } catch(e) {}
+                          } catch (e) {
+                            
+                          }
                         }
                       })()
                     }
@@ -456,10 +690,13 @@ const storageHierarchy = createMachine({
                 },
                 onDone: {
                   target: "awaitingCommand",
-                  actions: sendParent((_, evt) => ({
-                    type: "createFileSuccess",
-                    newFileId: evt.data
-                  }))
+                  actions: [
+                    raise("pruneExpiredLocks"),
+                    sendParent((_, evt) => ({
+                      type: "createFileSuccess",
+                      newFilePath: evt.data.leafPath
+                    }))
+                  ]
                 },
                 onError: {
                   target: "awaitingCommand",
@@ -470,82 +707,10 @@ const storageHierarchy = createMachine({
                 }
               }
             },
-            readFileById: {
+            readFile: {
               invoke: {
                 src: (ctx, evt) => {
-                  const { 
-                    db,
-                    cwd
-                  } = ctx
                   const {
-                    id
-                  } = evt.data
-                  return new Promise(
-                    (res, rej) => {
-                      (async () => {
-                        let newLockId
-                        try {
-                          const entity = await getEntityById(
-                            db,
-                            id
-                          )
-                          newLockId = await lockPath(
-                            db,
-                            cwd,
-                            entity.path,
-                            typeof evt.durationMs === "number" && evt.durationMs > 0 ? evt.durationMs : 5000
-                          )
-                          await rejectIfConflictingLockPathPrefixes(
-                            db,
-                            [newLockId]
-                          )
-                          if(entity.isLeaf){
-                            const fullFile = await joinContentToLeaf(
-                              db,
-                              entity
-                            )
-                            res(fullFile)
-                          } else {
-                            rej(
-                              `Cannot read a directory. Path: ${
-                                entity.path
-                              }`
-                            )
-                          }
-                        } catch(e) {
-                          rej(e)
-                        } finally {
-                          try {
-                            if(newLockId) await removeLockById(
-                              db,
-                              newLockId
-                            );
-                          } catch(e) {}
-                        }
-                      })()
-                    }
-                  )
-                }, 
-                onDone: {
-                  target: "awaitingCommand",
-                  actions: sendParent((_, evt) => ({
-                    type: "readFileSuccess",
-                    file: evt.data
-                  }))
-                },
-                onError: {
-                  target: "awaitingCommand",
-                  actions: sendParent((_, evt) => ({
-                    type: "readFileFailure",
-                    msg: evt.data
-                  }))
-                }
-              }
-            },
-            readFileByPath: {
-              invoke: {
-                src: (ctx, evt) => {
-                  const { 
                     db,
                     cwd
                   } = ctx
@@ -555,14 +720,14 @@ const storageHierarchy = createMachine({
                   return new Promise(
                     (res, rej) => {
                       (async () => {
-                        let newLockId
+                        let newLockPath
                         try {
-                          const entity = await getEntityByPath(
+                          const entity = await getEntity(
                             db,
                             cwd,
                             path
                           )
-                          newLockId = await lockPath(
+                          newLockPath = await lockPath(
                             db,
                             cwd,
                             entity.path,
@@ -570,9 +735,10 @@ const storageHierarchy = createMachine({
                           )
                           await rejectIfConflictingLockPathPrefixes(
                             db,
-                            [newLockId]
+                            cwd,
+                            [newLockPath]
                           )
-                          if(entity.isLeaf){
+                          if (entity.isLeaf) {
                             const fullFile = await joinContentToLeaf(
                               db,
                               entity
@@ -585,20 +751,20 @@ const storageHierarchy = createMachine({
                               }`
                             )
                           }
-                        } catch(e) {
+                        } catch (e) {
                           rej(e)
                         } finally {
                           try {
-                            if(newLockId) await removeLockById(
+                            if (newLockPath) await removeLock(
                               db,
-                              newLockId
+                              newLockPath
                             );
-                          } catch(e) {}
+                          } catch (e) { }
                         }
                       })()
                     }
                   )
-                }, 
+                },
                 onDone: {
                   target: "awaitingCommand",
                   actions: sendParent((_, evt) => ({
@@ -615,98 +781,27 @@ const storageHierarchy = createMachine({
                 }
               }
             },
-            renameFileById: {
+            updateFileTimestamp: {
               invoke: {
                 src: (ctx, evt) => {
-                  const { 
+                  const {
                     db,
                     cwd
                   } = ctx
                   const {
-                    id,
-                    newName
+                    path
                   } = evt.data
                   return new Promise(
                     (res, rej) => {
                       (async () => {
-                        let newLockId
+                        let newLockPath
                         try {
-                          const e = await getEntityById(
-                            db,
-                            id
-                          )
-                          newLockId = await lockPath(
-                            db,
-                            cwd,
-                            e.path,
-                            typeof evt.durationMs === "number" && evt.durationMs > 0 ? evt.durationMs : 5000
-                          )
-                          await rejectIfConflictingLockPathPrefixes(
-                            db,
-                            [newLockId]
-                          )
-                          res(await renameFileEntity(
-                            db,
-                            cwd,
-                            e.id,
-                            newName
-                          ))
-                        } catch(e) {
-                          rej(e)
-                        } finally {
-                          try {
-                            await removeLockById(
-                              db,
-                              newLockId
-                            )
-                          } catch(e) {}
-                        }
-                      })()
-                    }
-                  )
-                },
-                onDone: {
-                  target: "awaitingCommand",
-                  actions: [
-                    sendParent((_, evt) => ({
-                      type: "renameFileSuccess",
-                      filesRenamed: evt.data
-                    }))
-                  ]
-                },
-                onError: {
-                  target: "awaitingCommand",
-                  actions: [
-                    sendParent((_, evt) => ({
-                      type: "renameFileFailure",
-                      msg: evt.data
-                    }))
-                  ]
-                }
-              }
-            },
-            renameFileByPath: {
-              invoke: {
-                src: (ctx, evt) => {
-                  const { 
-                    db,
-                    cwd
-                  } = ctx
-                  const {
-                    path,
-                    newName
-                  } = evt.data
-                  return new Promise(
-                    (res, rej) => {
-                      (async () => {
-                        let newLockId
-                        try {
-                          const e = await getEntityByPath(
+                          const e = await getEntity(
                             db,
                             cwd,
                             path
                           )
-                          newLockId = await lockPath(
+                          newLockPath = await lockPath(
                             db,
                             cwd,
                             e.path,
@@ -714,90 +809,23 @@ const storageHierarchy = createMachine({
                           )
                           await rejectIfConflictingLockPathPrefixes(
                             db,
-                            [newLockId]
+                            cwd,
+                            [newLockPath]
                           )
-                          res(await renameFileEntity(
+                          res(await updateFileTimestamp(
                             db,
                             cwd,
-                            e.id,
-                            newName
+                            e.path
                           ))
-                        } catch(e) {
+                        } catch (e) {
                           rej(e)
                         } finally {
                           try {
-                            await removeLockById(
+                            await removeLock(
                               db,
-                              newLockId
+                              newLockPath
                             )
-                          } catch(e) {}
-                        }
-                      })()
-                    }
-                  )
-                },
-                onDone: {
-                  target: "awaitingCommand",
-                  actions: [
-                    sendParent((_, evt) => ({
-                      type: "renameFileSuccess",
-                      filesRenamed: evt.data
-                    }))
-                  ]
-                },
-                onError: {
-                  target: "awaitingCommand",
-                  actions: [
-                    sendParent((_, evt) => ({
-                      type: "renameFileFailure",
-                      msg: evt.data
-                    }))
-                  ]
-                }
-              }
-            },
-            updateFileTimestampById: {
-              invoke: {
-                src: (ctx, evt) => {
-                  const { 
-                    db,
-                    cwd
-                  } = ctx
-                  const {
-                    id
-                  } = evt.data
-                  return new Promise(
-                    (res, rej) => {
-                      (async () => {
-                        let newLockId
-                        try {
-                          const e = await getEntityById(
-                            db,
-                            id
-                          )
-                          newLockId = await lockPath(
-                            db,
-                            cwd,
-                            e.path,
-                            typeof evt.durationMs === "number" && evt.durationMs > 0 ? evt.durationMs : 5000
-                          )
-                          await rejectIfConflictingLockPathPrefixes(
-                            db,
-                            [newLockId]
-                          )
-                          res(await updateFileEntityTimestamp(
-                            db,
-                            e.id
-                          ))
-                        } catch(e) {
-                          rej(e)
-                        } finally {
-                          try {
-                            await removeLockById(
-                              db,
-                              newLockId
-                            )
-                          } catch(e) {}
+                          } catch (e) { }
                         }
                       })()
                     }
@@ -823,10 +851,85 @@ const storageHierarchy = createMachine({
                 }
               }
             },
-            updateFileTimestampByPath: {
+            updateFileContent: {
               invoke: {
                 src: (ctx, evt) => {
-                  const { 
+                  const {
+                    db,
+                    cwd
+                  } = ctx
+                  const {
+                    path,
+                    content
+                  } = evt.data
+                  return new Promise(
+                    (res, rej) => {
+                      (async () => {
+                        let newLockPath
+                        try {
+                          const e = await getEntity(
+                            db,
+                            cwd,
+                            path
+                          )
+                          newLockPath = await lockPath(
+                            db,
+                            cwd,
+                            e.path,
+                            typeof evt.durationMs === "number" && evt.durationMs > 0 ? evt.durationMs : 5000
+                          )
+                          await rejectIfConflictingLockPathPrefixes(
+                            db,
+                            cwd,
+                            [newLockPath]
+                          )
+                          const u = await updateFile(
+                            db,
+                            cwd,
+                            e.path,
+                            content
+                          )
+                          console.log(
+                            `u: ${
+                              JSON.stringify(u)
+                            }`
+                          )
+                          res(u)
+                        } catch (e) {
+                          console.log(e)
+                          rej(e)
+                        } finally {
+                          try {
+                            await removeLock(
+                              db,
+                              newLockPath
+                            )
+                          } catch (e) { }
+                        }
+                      })()
+                    }
+                  )
+                },
+                onDone: {
+                  target: "awaitingCommand",
+                  actions: sendParent((_, evt) => ({
+                    type: "updateFileSuccess",
+                    filesTouched: evt.data
+                  }))
+                },
+                onError: {
+                  target: "awaitingCommand",
+                  actions: sendParent((_, evt) => ({
+                    type: "updateFileFailure",
+                    msg: evt.data
+                  }))
+                }
+              }
+            },
+            deleteFile: {
+              invoke: {
+                src: (ctx, evt) => {
+                  const {
                     db,
                     cwd
                   } = ctx
@@ -836,14 +939,14 @@ const storageHierarchy = createMachine({
                   return new Promise(
                     (res, rej) => {
                       (async () => {
-                        let newLockId
+                        let newLockPath
                         try {
-                          const e = await getEntityByPath(
+                          const e = await getEntity(
                             db,
                             cwd,
                             path
                           )
-                          newLockId = await lockPath(
+                          newLockPath = await lockPath(
                             db,
                             cwd,
                             e.path,
@@ -851,379 +954,23 @@ const storageHierarchy = createMachine({
                           )
                           await rejectIfConflictingLockPathPrefixes(
                             db,
-                            [newLockId]
-                          )
-                          res(await updateFileEntityTimestamp(
-                            db,
-                            e.id
-                          ))
-                        } catch(e) {
-                          rej(e)
-                        } finally {
-                          try {
-                            await removeLockById(
-                              db,
-                              newLockId
-                            )
-                          } catch(e) {}
-                        }
-                      })()
-                    }
-                  )
-                },
-                onDone: {
-                  target: "awaitingCommand",
-                  actions: [
-                    sendParent((_, evt) => ({
-                      type: "updateFileTimestampSuccess",
-                      filesTouched: evt.data
-                    }))
-                  ]
-                },
-                onError: {
-                  target: "awaitingCommand",
-                  actions: [
-                    sendParent((_, evt) => ({
-                      type: "updateFileTimestampFailure",
-                      msg: evt.data
-                    }))
-                  ]
-                }
-              }
-            },
-            updateFileContentById: {
-              invoke: {
-                src: (ctx, evt) => {
-                  const { 
-                    db,
-                    cwd
-                  } = ctx
-                  const {
-                    id,
-                    content
-                  } = evt.data
-                  return new Promise(
-                    (res, rej) => {
-                      (async () => {
-                        let newLockId
-                        try {
-                          const e = await getEntityById(
-                            db,
-                            id
-                          )
-                          newLockId = await lockPath(
-                            db,
                             cwd,
-                            e.path,
-                            typeof evt.durationMs === "number" && evt.durationMs > 0 ? evt.durationMs : 5000
-                          )
-                          await rejectIfConflictingLockPathPrefixes(
-                            db,
-                            [newLockId]
-                          )
-                          res(await updateFileEntity(
-                            db,
-                            e.id,
-                            content
-                          ))
-                        } catch(e) {
-                          rej(e)
-                        } finally {
-                          try {
-                            await removeLockById(
-                              db,
-                              newLockId
-                            )
-                          } catch(e) {}
-                        }
-                      })()
-                    }
-                  )
-                },
-                onDone: {
-                  target: "awaitingCommand",
-                  actions: sendParent((_, evt) => ({
-                    type: "updateFileSuccess",
-                    filesTouched: evt.data
-                  }))
-                },
-                onError: {
-                  target: "awaitingCommand",
-                  actions: sendParent((_, evt) => ({
-                    type: "updateFileFailure",
-                    msg: evt.data
-                  }))
-                }
-              }
-            },
-            updateFileContentByPath: {
-              invoke: {
-                src: (ctx, evt) => {
-                  const { 
-                    db,
-                    cwd
-                  } = ctx
-                  const {
-                    id,
-                    path,
-                    content
-                  } = evt.data
-                  return new Promise(
-                    (res, rej) => {
-                      (async () => {
-                        let newLockId
-                        try {
-                          const e = await getEntityByPath(
-                            db,
-                            cwd,
-                            path
-                          )
-                          newLockId = await lockPath(
-                            db,
-                            cwd,
-                            e.path,
-                            typeof evt.durationMs === "number" && evt.durationMs > 0 ? evt.durationMs : 5000
-                          )
-                          await rejectIfConflictingLockPathPrefixes(
-                            db,
-                            [newLockId]
-                          )
-                          res(await updateFileEntity(
-                            db,
-                            e.id,
-                            content
-                          ))
-                        } catch(e) {
-                          rej(e)
-                        } finally {
-                          try {
-                            await removeLockById(
-                              db,
-                              newLockId
-                            )
-                          } catch(e) {}
-                        }
-                      })()
-                    }
-                  )
-                },
-                onDone: {
-                  target: "awaitingCommand",
-                  actions: sendParent((_, evt) => ({
-                    type: "updateFileSuccess",
-                    filesTouched: evt.data
-                  }))
-                },
-                onError: {
-                  target: "awaitingCommand",
-                  actions: sendParent((_, evt) => ({
-                    type: "updateFileFailure",
-                    msg: evt.data
-                  }))
-                }
-              }
-            },
-            reparentFileById: {
-              invoke: {
-                src: (ctx, evt) => {
-                  const { 
-                    db,
-                    cwd
-                  } = ctx
-                  const {
-                    id,
-                    newParentId
-                  } = evt.data
-                  return new Promise(
-                    (res, rej) => {
-                      (async () => {
-                        let newLockId
-                        try {
-                          const e = await getEntityById(
-                            db,
-                            id
-                          )
-                          // also get target patho
-                          const t = await getEntityById(
-                            db,
-                            newParentId
-                          )
-                          // calculate greatest common prefix of old and new path
-                          const prefixChars = []
-                          for(var i = 0; i < Math.min(e.path.length, t.path.length); i++){
-                            if(e.path[i] !== t.path[i]){
-                              break
-                            }
-                            prefixChars.push(e.path[i])
-                          }
-                          const gcp = prefixChars.join("")
-                          newLockId = await lockPath(
-                            db,
-                            cwd,
-                            gcp,
-                            typeof evt.durationMs === "number" && evt.durationMs > 0 ? evt.durationMs : 5000
-                          )
-                          await rejectIfConflictingLockPathPrefixes(
-                            db,
-                            [newLockId]
-                          )
-                          res(await updateFileEntity(
-                            db,
-                            e.id,
-                            content
-                          ))
-                        } catch(e) {
-                          rej(e)
-                        } finally {
-                          try {
-                            await removeLockById(
-                              db,
-                              newLockId
-                            )
-                          } catch(e) {}
-                        }
-                      })()
-                    }
-                  )
-                },
-                onDone: {
-                  target: "awaitingCommand",
-                  actions: sendParent((_, evt) => ({
-                    type: "updateFileSuccess",
-                    filesTouched: evt.data
-                  }))
-                },
-                onError: {
-                  target: "awaitingCommand",
-                  actions: sendParent((_, evt) => ({
-                    type: "updateFileFailure",
-                    msg: evt.data
-                  }))
-                }
-              }
-            },
-            reparentFileByPath: {
-              invoke: {
-                src: (ctx, evt) => {
-                  const { 
-                    db,
-                    cwd
-                  } = ctx
-                  const {
-                    path,
-                    newParentPath
-                  } = evt.data
-                  return new Promise(
-                    (res, rej) => {
-                      (async () => {
-                        let newLockId
-                        try {
-                          const e = await getEntityByPath(
-                            db,
-                            cwd,
-                            path
-                          )
-                          // also get target patho
-                          const t = await getEntityByPath(
-                            db,
-                            newParentPath
-                          )
-                          // calculate greatest common prefix of old and new path
-                          const prefixChars = []
-                          for(var i = 0; i < Math.min(e.path.length, t.path.length); i++){
-                            if(e.path[i] !== t.path[i]){
-                              break
-                            }
-                            prefixChars.push(e.path[i])
-                          }
-                          const gcp = prefixChars.join("")
-                          newLockId = await lockPath(
-                            db,
-                            cwd,
-                            gcp,
-                            typeof evt.durationMs === "number" && evt.durationMs > 0 ? evt.durationMs : 5000
-                          )
-                          await rejectIfConflictingLockPathPrefixes(
-                            db,
-                            [newLockId]
-                          )
-                          res(await updateFileEntity(
-                            db,
-                            e.id,
-                            content
-                          ))
-                        } catch(e) {
-                          rej(e)
-                        } finally {
-                          try {
-                            await removeLockById(
-                              db,
-                              newLockId
-                            )
-                          } catch(e) {}
-                        }
-                      })()
-                    }
-                  )
-                },
-                onDone: {
-                  target: "awaitingCommand",
-                  actions: sendParent((_, evt) => ({
-                    type: "updateFileSuccess",
-                    filesTouched: evt.data
-                  }))
-                },
-                onError: {
-                  target: "awaitingCommand",
-                  actions: sendParent((_, evt) => ({
-                    type: "updateFileFailure",
-                    msg: evt.data
-                  }))
-                }
-              }
-            },
-            deleteFileById: {
-              invoke: {
-                src: (ctx, evt) => {
-                  const { 
-                    db,
-                    cwd
-                  } = ctx
-                  const {
-                    id
-                  } = evt.data
-                  return new Promise(
-                    (res, rej) => {
-                      (async () => {
-                        let newLockId
-                        try {
-                          const e = await getEntityById(
-                            db,
-                            id
-                          )
-                          newLockId = await lockPath(
-                            db,
-                            cwd,
-                            e.path,
-                            typeof evt.durationMs === "number" && evt.durationMs > 0 ? evt.durationMs : 5000
-                          )
-                          await rejectIfConflictingLockPathPrefixes(
-                            db,
-                            [newLockId]
+                            [newLockPath]
                           )
                           res(await deleteLeafEntity(
                             db,
-                            e.id
+                            cwd,
+                            e.path
                           ))
-                        } catch(e){
+                        } catch (e) {
                           rej(e)
-                        } finally{
+                        } finally {
                           try {
-                            await removeLockById(
+                            await removeLock(
                               db,
-                              newLockId
+                              newLockPath
                             )
-                          } catch(e) {}
+                          } catch (e) { }
                         }
                       })()
                     }
@@ -1244,138 +991,10 @@ const storageHierarchy = createMachine({
                 }
               }
             },
-            deleteFileByPath: {
+            createDirectory: {
               invoke: {
                 src: (ctx, evt) => {
-                  const { 
-                    db,
-                    cwd
-                  } = ctx
                   const {
-                    path
-                  } = evt.data
-                  return new Promise(
-                    (res, rej) => {
-                      (async () => {
-                        let newLockId
-                        try {
-                          const e = await getEntityByPath(
-                            db,
-                            cwd,
-                            path
-                          )
-                          newLockId = await lockPath(
-                            db,
-                            cwd,
-                            e.path,
-                            typeof evt.durationMs === "number" && evt.durationMs > 0 ? evt.durationMs : 5000
-                          )
-                          await rejectIfConflictingLockPathPrefixes(
-                            db,
-                            [newLockId]
-                          )
-                          res(await deleteLeafEntity(
-                            db,
-                            e.id
-                          ))
-                        } catch(e){
-                          rej(e)
-                        } finally{
-                          try {
-                            await removeLockById(
-                              db,
-                              newLockId
-                            )
-                          } catch(e) {}
-                        }
-                      })()
-                    }
-                  )
-                },
-                onDone: {
-                  target: "awaitingCommand",
-                  actions: sendParent((_, evt) => ({
-                    type: "deleteFileSuccess"
-                  })),
-                },
-                onError: {
-                  target: "awaitingCommand",
-                  actions: sendParent((_, evt) => ({
-                    type: "deleteFileFailure",
-                    msg: evt.data
-                  }))
-                }
-              }
-            },
-            createDirectoryUnderId: {
-              invoke: {
-                src: (ctx, evt) => {
-                  const { 
-                    db,
-                    cwd
-                  } = ctx
-                  const {
-                    name,
-                    parentId
-                  } = evt.data
-                  return new Promise(
-                    (res, rej) => {
-                      (async () => {
-                        let newLockId
-                        try {
-                          const e = await getEntityById(
-                            db,
-                            parentId
-                          )
-                          newLockId = await lockPath(
-                            db,
-                            cwd,
-                            e.path,
-                            typeof evt.durationMs === "number" && evt.durationMs > 0 ? evt.durationMs : 5000
-                          )
-                          await rejectIfConflictingLockPathPrefixes(
-                            db,
-                            [newLockId]
-                          )
-                          res(await addDirectoryEntity(
-                            db,
-                            cwd,
-                            name,
-                            e.id
-                          ))
-                        } catch(e){
-                          rej(e)
-                        } finally{
-                          try {
-                            await removeLockById(
-                              db,
-                              newLockId
-                            )
-                          } catch(e) {}
-                        }
-                      })()
-                    }
-                  )
-                },
-                onDone: {
-                  target: "awaitingCommand",
-                  actions: sendParent((_, evt) => ({
-                    type: "createDirectorySuccess"
-                  })),
-                },
-                onError: {
-                  target: "awaitingCommand",
-                  actions: sendParent((_, evt) => ({
-                    type: "createDirectoryFailure",
-                    msg: evt.data
-                  }))
-                }
-              }
-            },
-            createDirectoryUnderPath: {
-              invoke: {
-                src: (ctx, evt) => {
-                  const { 
                     db,
                     cwd
                   } = ctx
@@ -1386,14 +1005,19 @@ const storageHierarchy = createMachine({
                   return new Promise(
                     (res, rej) => {
                       (async () => {
-                        let newLockId
+                        let newLockPath
                         try {
-                          const e = await getEntityByPath(
+                          const e = await getEntity(
                             db,
                             cwd,
                             parentPath
                           )
-                          newLockId = await lockPath(
+                          console.log(`e ${
+                            JSON.stringify(
+                              e
+                            )
+                          }`)
+                          newLockPath = await lockPath(
                             db,
                             cwd,
                             e.path,
@@ -1401,23 +1025,25 @@ const storageHierarchy = createMachine({
                           )
                           await rejectIfConflictingLockPathPrefixes(
                             db,
-                            [newLockId]
+                            cwd,
+                            [newLockPath]
                           )
                           res(await addDirectoryEntity(
                             db,
                             cwd,
                             name,
-                            e.id
+                            e.path
                           ))
-                        } catch(e){
+                        } catch (e) {
+                          console.log(e)
                           rej(e)
-                        } finally{
+                        } finally {
                           try {
-                            await removeLockById(
+                            await removeLock(
                               db,
-                              newLockId
+                              newLockPath
                             )
-                          } catch(e) {}
+                          } catch (e) { }
                         }
                       })()
                     }
@@ -1425,39 +1051,56 @@ const storageHierarchy = createMachine({
                 },
                 onDone: {
                   target: "awaitingCommand",
-                  actions: sendParent((_, evt) => ({
-                    type: "createDirectorySuccess"
-                  })),
+                  actions: [
+                    sendParent((_, evt) => ({
+                      type: "createDirectorySuccess"
+                    }))
+                  ],
                 },
                 onError: {
                   target: "awaitingCommand",
-                  actions: sendParent((_, evt) => ({
-                    type: "createDirectoryFailure",
-                    msg: evt.data
-                  }))
+                  actions: [
+                    sendParent((_, evt) => ({
+                      type: "createDirectoryFailure",
+                      msg: evt.data
+                    }))
+                  ]
                 }
               }
             },
-            getDirectoryRecordById: {
+            getDirectoryRecord: {
               invoke: {
                 src: (ctx, evt) => {
-                  const { 
+                  const {
                     db,
                     cwd
                   } = ctx
+                  if(
+                    typeof evt.data === "undefined"
+                  ){
+                    return new Promise(
+                      r => r(
+                        {
+                          childKeys: [],
+                          cwd: cwd
+                        }
+                      )
+                    )
+                  }
                   const {
-                    id
+                    path
                   } = evt.data
                   return new Promise(
                     (res, rej) => {
                       (async () => {
-                        let newLockId
+                        let newLockPath
                         try {
-                          const entity = await getEntityById(
+                          const entity = await getEntity(
                             db,
-                            id
+                            cwd,
+                            path
                           )
-                          newLockId = await lockPath(
+                          newLockPath = await lockPath(
                             db,
                             cwd,
                             entity.path,
@@ -1465,9 +1108,10 @@ const storageHierarchy = createMachine({
                           )
                           await rejectIfConflictingLockPathPrefixes(
                             db,
-                            [newLockId]
+                            cwd,
+                            [newLockPath]
                           )
-                          if(entity.isLeaf){
+                          if (entity.isLeaf) {
                             rej(
                               `Cannot get directory record for leaf entity: ${
                                 entity.path
@@ -1477,8 +1121,8 @@ const storageHierarchy = createMachine({
                             const childKeys = await getImmediateChildKeysOfDirectory(
                               db,
                               cwd,
-                              id
-                            )
+                              entity.path
+                            ) // throws
                             res(
                               {
                                 entity,
@@ -1486,15 +1130,16 @@ const storageHierarchy = createMachine({
                               }
                             )
                           }
-                        } catch(e) {
+                        } catch (e) {
+                          console.log(e.toString())
                           rej(e)
                         } finally {
                           try {
-                            if(newLockId) await removeLockById(
+                            if (newLockPath) await removeLock(
                               db,
-                              newLockId
+                              newLockPath
                             );
-                          } catch(e) {}
+                          } catch (e) { }
                         }
                       })()
                     }
@@ -1503,23 +1148,23 @@ const storageHierarchy = createMachine({
                 onDone: {
                   target: "awaitingCommand",
                   actions: sendParent((_, evt) => ({
-                    type: "readDirectoryRecordSuccess",
+                    type: "getDirectoryRecordSuccess",
                     data: evt.data
                   })),
                 },
                 onError: {
                   target: "awaitingCommand",
                   actions: sendParent((_, evt) => ({
-                    type: "readDirectoryRecordFailure",
+                    type: "getDirectoryRecordFailure",
                     msg: evt.data
                   }))
                 }
               }
             },
-            getDirectoryRecordByPath: {
+            emptyDirectory: {
               invoke: {
                 src: (ctx, evt) => {
-                  const { 
+                  const {
                     db,
                     cwd
                   } = ctx
@@ -1529,14 +1174,14 @@ const storageHierarchy = createMachine({
                   return new Promise(
                     (res, rej) => {
                       (async () => {
-                        let newLockId
+                        let newLockPath
                         try {
-                          const entity = await getEntityByPath(
+                          const entity = await getEntity(
                             db,
                             cwd,
                             path
                           )
-                          newLockId = await lockPath(
+                          newLockPath = await lockPath(
                             db,
                             cwd,
                             entity.path,
@@ -1544,87 +1189,10 @@ const storageHierarchy = createMachine({
                           )
                           await rejectIfConflictingLockPathPrefixes(
                             db,
-                            [newLockId]
-                          )
-                          if(entity.isLeaf){
-                            rej(
-                              `Cannot get directory record for leaf entity: ${
-                                entity.path
-                              }`
-                            )
-                          } else {
-                            const childKeys = await getImmediateChildKeysOfDirectory(
-                              db,
-                              cwd,
-                              id
-                            )
-                            res(
-                              {
-                                entity,
-                                childKeys
-                              }
-                            )
-                          }
-                        } catch(e) {
-                          rej(e)
-                        } finally {
-                          try {
-                            if(newLockId) await removeLockById(
-                              db,
-                              newLockId
-                            );
-                          } catch(e) {}
-                        }
-                      })()
-                    }
-                  )
-                },
-                onDone: {
-                  target: "awaitingCommand",
-                  actions: sendParent((_, evt) => ({
-                    type: "readDirectoryRecordSuccess",
-                    data: evt.data
-                  })),
-                },
-                onError: {
-                  target: "awaitingCommand",
-                  actions: sendParent((_, evt) => ({
-                    type: "readDirectoryRecordFailure",
-                    msg: evt.data
-                  }))
-                }
-              }
-            },
-            emptyDirectoryById: {
-              invoke: {
-                src: (ctx, evt) => {
-                  const { 
-                    db,
-                    cwd
-                  } = ctx
-                  const {
-                    id
-                  } = evt.data
-                  return new Promise(
-                    (res, rej) => {
-                      (async () => {
-                        let newLockId
-                        try {
-                          const entity = await getEntityById(
-                            db,
-                            id
-                          )
-                          newLockId = await lockPath(
-                            db,
                             cwd,
-                            entity.path,
-                            typeof evt.durationMs === "number" && evt.durationMs > 0 ? evt.durationMs : 5000
+                            [newLockPath]
                           )
-                          await rejectIfConflictingLockPathPrefixes(
-                            db,
-                            [newLockId]
-                          )
-                          if(entity.isLeaf){
+                          if (entity.isLeaf) {
                             rej(
                               `Cannot call empty directory for leaf entity: ${
                                 entity.path
@@ -1633,19 +1201,20 @@ const storageHierarchy = createMachine({
                           } else {
                             await emptyDirectory(
                               db,
-                              id
+                              cwd,
+                              entity.path
                             )
                             res()
                           }
-                        } catch(e) {
+                        } catch (e) {
                           rej(e)
                         } finally {
                           try {
-                            if(newLockId) await removeLockById(
+                            if (newLockPath) await removeLock(
                               db,
-                              newLockId
+                              newLockPath
                             );
-                          } catch(e) {}
+                          } catch (e) { }
                         }
                       })()
                     }
@@ -1666,10 +1235,10 @@ const storageHierarchy = createMachine({
                 }
               }
             },
-            emptyDirectoryByPath: {
+            deleteDirectoryIfEmpty: {
               invoke: {
                 src: (ctx, evt) => {
-                  const { 
+                  const {
                     db,
                     cwd
                   } = ctx
@@ -1679,85 +1248,14 @@ const storageHierarchy = createMachine({
                   return new Promise(
                     (res, rej) => {
                       (async () => {
-                        let newLockId
+                        let newLockPath
                         try {
-                          const entity = await getEntityByPath(
+                          const e = await getEntity(
                             db,
                             cwd,
                             path
                           )
-                          newLockId = await lockPath(
-                            db,
-                            cwd,
-                            entity.path,
-                            typeof evt.durationMs === "number" && evt.durationMs > 0 ? evt.durationMs : 5000
-                          )
-                          await rejectIfConflictingLockPathPrefixes(
-                            db,
-                            [newLockId]
-                          )
-                          if(entity.isLeaf){
-                            rej(
-                              `Cannot call empty directory for leaf entity: ${
-                                entity.path
-                              }`
-                            )
-                          } else {
-                            await emptyDirectory(
-                              db,
-                              id
-                            )
-                            res()
-                          }
-                        } catch(e) {
-                          rej(e)
-                        } finally {
-                          try {
-                            if(newLockId) await removeLockById(
-                              db,
-                              newLockId
-                            );
-                          } catch(e) {}
-                        }
-                      })()
-                    }
-                  )
-                },
-                onDone: {
-                  target: "awaitingCommand",
-                  actions: sendParent((_, evt) => ({
-                    type: "emptyDirectorySuccess"
-                  })),
-                },
-                onError: {
-                  target: "awaitingCommand",
-                  actions: sendParent((_, evt) => ({
-                    type: "emptyDirectoryFailure",
-                    msg: evt.data
-                  }))
-                }
-              }
-            },
-            deleteDirectoryIfEmptyById: {
-              invoke: {
-                src: (ctx, evt) => {
-                  const { 
-                    db,
-                    cwd
-                  } = ctx
-                  const {
-                    id
-                  } = evt.data
-                  return new Promise(
-                    (res, rej) => {
-                      (async () => {
-                        let newLockId
-                        try {
-                          const e = await getEntityById(
-                            db,
-                            id
-                          )
-                          newLockId = await lockPath(
+                          newLockPath = await lockPath(
                             db,
                             cwd,
                             e.path,
@@ -1765,21 +1263,24 @@ const storageHierarchy = createMachine({
                           )
                           await rejectIfConflictingLockPathPrefixes(
                             db,
-                            [newLockId]
+                            cwd,
+                            [newLockPath]
                           )
                           res(await deleteDirectoryIfEmpty(
                             db,
-                            e.id
+                            cwd,
+                            e.path
                           ))
-                        } catch(e){
+                        } catch (e) {
                           rej(e)
-                        } finally{
+                        } finally {
                           try {
-                            await removeLockById(
+                            await removeLock(
                               db,
-                              newLockId
+                              cwd,
+                              newLockPath
                             )
-                          } catch(e) {}
+                          } catch (e) { }
                         }
                       })()
                     }
@@ -1788,236 +1289,114 @@ const storageHierarchy = createMachine({
                 onDone: {
                   target: "awaitingCommand",
                   actions: sendParent((_, evt) => ({
-                    type: "deleteDirectorySuccess"
+                    type: "deleteDirectoryIfEmptySuccess"
                   })),
                 },
                 onError: {
                   target: "awaitingCommand",
                   actions: sendParent((_, evt) => ({
-                    type: "deleteDirectoryFailure",
+                    type: "deleteDirectoryIfEmptyFailure",
                     msg: evt.data
                   }))
                 }
               }
             },
-            deleteDirectoryIfEmptyByPath: {
+            ripFilesystemToJSON: {
               invoke: {
-                src: (ctx, evt) => {
-                  const { 
-                    db,
-                    cwd
-                  } = ctx
-                  const {
-                    path
-                  } = evt.data
-                  return new Promise(
-                    (res, rej) => {
-                      (async () => {
-                        let newLockId
-                        try {
-                          const e = await getEntityByPath(
-                            db,
-                            cwd,
-                            path
+                src: (ctx, evt) => Promise.all(
+                  [
+                    new Promise(
+                      (res, rej) => {
+                        const {
+                          db
+                        } = ctx
+                        const entityTable = db
+                          .transaction(
+                            "entity",
+                            "readonly"
+                          ).objectStore(
+                            "entity"
                           )
-                          newLockId = await lockPath(
-                            db,
-                            cwd,
-                            e.path,
-                            typeof evt.durationMs === "number" && evt.durationMs > 0 ? evt.durationMs : 5000
-                          )
-                          await rejectIfConflictingLockPathPrefixes(
-                            db,
-                            [newLockId]
-                          )
-                          res(await deleteDirectoryIfEmpty(
-                            db,
-                            e.id
-                          ))
-                        } catch(e){
-                          rej(e)
-                        } finally{
-                          try {
-                            await removeLockById(
-                              db,
-                              newLockId
-                            )
-                          } catch(e) {}
+                        const rq = entityTable
+                          .getAll()
+                        rq.onsuccess = () => {
+                          res(rq.result)
                         }
-                      })()
-                    }
-                  )
-                },
+                        rq.onerror = () => {
+                          rej(
+                            "Could not getAll entity records"
+                          )
+                        }
+                      }
+                    ),
+                    new Promise(
+                      (res, rej) => {
+                        const {
+                          db
+                        } = ctx
+                        const entityTable = db
+                          .transaction(
+                            "content",
+                            "readonly"
+                          ).objectStore(
+                            "content"
+                          )
+                        const rq = entityTable
+                          .getAll()
+                        rq.onsuccess = () => {
+                          res(rq.result)
+                        }
+                        rq.onerror = () => {
+                          rej(
+                            "Could not getAll content records"
+                          )
+                        }
+                      }
+                    ),
+                    new Promise(
+                      (res, rej) => {
+                        const {
+                          db
+                        } = ctx
+                        const entityTable = db
+                          .transaction(
+                            "lock",
+                            "readonly"
+                          ).objectStore(
+                            "lock"
+                          )
+                        const rq = entityTable
+                          .getAll()
+                        rq.onsuccess = () => {
+                          res(rq.result)
+                        }
+                        rq.onerror = () => {
+                          rej(
+                            "Could not getAll lock records"
+                          )
+                        }
+                      }
+                    )
+                  ]
+                ),
                 onDone: {
                   target: "awaitingCommand",
-                  actions: sendParent((_, evt) => ({
-                    type: "deleteFileSuccess"
-                  })),
+                  actions: [
+                    log((_, evt) => evt),
+                    sendParent((_, evt) => ({
+                      type: "ripFilesystemToJSONSuccess",
+                      backup: JSON.stringify({
+                        entity: evt.data[0],
+                        content: evt.data[1],
+                        lock: evt.data[2]
+                      })
+                    }))
+                  ],
                 },
                 onError: {
                   target: "awaitingCommand",
                   actions: sendParent((_, evt) => ({
-                    type: "deleteFileFailure",
-                    msg: evt.data
-                  }))
-                }
-              }
-            },
-            transplantAncestorsById: {
-              invoke: {
-                src: (ctx, evt) => {
-                  const { 
-                    db,
-                    cwd
-                  } = ctx
-                  const {
-                    oldParentId,
-                    newParentId
-                  } = evt.data
-                  return new Promise(
-                    (res, rej) => {
-                      (async () => {
-                        let newLockId
-                        try {
-                          const e = await getEntityById(
-                            db,
-                            oldParentId
-                          )
-                          // also get target path
-                          const t = await getEntityById(
-                            db,
-                            newParentId
-                          )
-                          // calculate greatest common prefix of old and new path
-                          const prefixChars = []
-                          for(var i = 0; i < Math.min(e.path.length, t.path.length); i++){
-                            if(e.path[i] !== t.path[i]){
-                              break
-                            }
-                            prefixChars.push(e.path[i])
-                          }
-                          const gcp = prefixChars.join("")
-                          newLockId = await lockPath(
-                            db,
-                            cwd,
-                            gcp,
-                            typeof evt.durationMs === "number" && evt.durationMs > 0 ? evt.durationMs : 5000
-                          )
-                          await rejectIfConflictingLockPathPrefixes(
-                            db,
-                            [newLockId]
-                          )
-                          res(await transplantAncestors(
-                            db,
-                            e.id,
-                            t.id
-                          ))
-                        } catch(e) {
-                          rej(e)
-                        } finally {
-                          try {
-                            await removeLockById(
-                              db,
-                              newLockId
-                            )
-                          } catch(e) {}
-                        }
-                      })()
-                    }
-                  )
-                },
-                onDone: {
-                  target: "awaitingCommand",
-                  actions: sendParent((_, evt) => ({
-                    type: "transplantAncestorsSuccess",
-                    msg: evt.data
-                  }))
-                },
-                onError: {
-                  target: "awaitingCommand",
-                  actions: sendParent((_, evt) => ({
-                    type: "transplantAncestorsFailure",
-                    msg: evt.data
-                  }))
-                }
-              }
-            },
-            transplantAncestorsByPath: {
-              invoke: {
-                src: (ctx, evt) => {
-                  const { 
-                    db,
-                    cwd
-                  } = ctx
-                  const {
-                    oldParentPath,
-                    newParentPath
-                  } = evt.data
-                  return new Promise(
-                    (res, rej) => {
-                      (async () => {
-                        let newLockId
-                        try {
-                          const e = await getEntityByPath(
-                            db,
-                            cwd,
-                            oldParentPath
-                          )
-                          // also get target path
-                          const t = await getEntityByPath(
-                            db,
-                            cwd,
-                            newParentPath
-                          )
-                          // calculate greatest common prefix of old and new path
-                          const prefixChars = []
-                          for(var i = 0; i < Math.min(e.path.length, t.path.length); i++){
-                            if(e.path[i] !== t.path[i]){
-                              break
-                            }
-                            prefixChars.push(e.path[i])
-                          }
-                          const gcp = prefixChars.join("")
-                          newLockId = await lockPath(
-                            db,
-                            cwd,
-                            gcp,
-                            typeof evt.durationMs === "number" && evt.durationMs > 0 ? evt.durationMs : 5000
-                          )
-                          await rejectIfConflictingLockPathPrefixes(
-                            db,
-                            [newLockId]
-                          )
-                          res(await transplantAncestors(
-                            db,
-                            e.id,
-                            t.id
-                          ))
-                        } catch(e) {
-                          rej(e)
-                        } finally {
-                          try {
-                            await removeLockById(
-                              db,
-                              newLockId
-                            )
-                          } catch(e) {}
-                        }
-                      })()
-                    }
-                  )
-                },
-                onDone: {
-                  target: "awaitingCommand",
-                  actions: sendParent((_, evt) => ({
-                    type: "transplantAncestorsSuccess",
-                    msg: evt.data
-                  }))
-                },
-                onError: {
-                  target: "awaitingCommand",
-                  actions: sendParent((_, evt) => ({
-                    type: "transplantAncestorsFailure",
+                    type: "ripFilesystemToJSONFailure",
                     msg: evt.data
                   }))
                 }
@@ -2026,7 +1405,7 @@ const storageHierarchy = createMachine({
             close: {
               type: "final",
               entry: [
-                send(
+                raise(
                   "stopLockPruningService"
                 ),
                 assign(ctx => {
